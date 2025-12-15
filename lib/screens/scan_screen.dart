@@ -7,7 +7,8 @@ import 'package:flutter/foundation.dart';
 import 'package:google_mlkit_barcode_scanning/google_mlkit_barcode_scanning.dart';
 import 'package:google_mlkit_commons/google_mlkit_commons.dart';
 import 'package:permission_handler/permission_handler.dart';
-
+import 'package:google_mlkit_image_labeling/google_mlkit_image_labeling.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import '../routes.dart';
 import '../services/openfoodfacts_service.dart';
 import '../models/product.dart';
@@ -24,6 +25,10 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
   List<CameraDescription> cameras = [];
   final barcodeScanner = BarcodeScanner();
   final ofService = OpenFoodFactsService();
+  final ImageLabeler imageLabeler = ImageLabeler(
+    options: ImageLabelerOptions(confidenceThreshold: 0.6),
+  );
+  final TextRecognizer textRecognizer = TextRecognizer();
 
   bool _processing = false;
   Timer? _resumeTimer;
@@ -73,7 +78,6 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
 
       setState(() {});
     } catch (e) {
-      debugPrint("Camera init error: $e");
       if (mounted) {
         ScaffoldMessenger.of(
           context,
@@ -85,7 +89,6 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
   void _startFallbackTimer() {
     _fallbackTimer?.cancel();
     _fallbackTimer = Timer(Duration(seconds: kFallbackSeconds), () async {
-      debugPrint('Fallback timer fired — trying full-photo scan');
       await _tryImageFileScanFallback();
     });
   }
@@ -101,38 +104,99 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
       return;
     }
 
-    // stop stream to take a high-quality picture
+    // stop stream
     try {
       await controller!.stopImageStream();
     } catch (_) {}
 
     XFile? xfile;
+
     try {
       xfile = await controller!.takePicture();
-      debugPrint('Fallback picture saved: ${xfile.path}');
+
       final inputImage = InputImage.fromFilePath(xfile.path);
+
       final barcodes = await barcodeScanner.processImage(inputImage);
-      debugPrint('Fallback file barcodes: ${barcodes.length}');
+
       if (barcodes.isNotEmpty) {
         final code = barcodes.first.rawValue;
         if (code != null && code.isNotEmpty) {
           await _onBarcodeDetected(code);
           return;
         }
+      }
+      // 2. Try Text Recognition
+      final recognizedText = await textRecognizer.processImage(inputImage);
+      String? bestText;
+
+      // Simple heuristic: take the largest block of text or just the first non-empty one
+      // You can refine this to look for specific patterns or largest bounding box
+      if (recognizedText.blocks.isNotEmpty) {
+        // filter out small text or numbers if needed
+        // For now, let's try the longest block found, as brand names are often prominent
+        String? candidate;
+        int maxLength = 0;
+
+        for (final block in recognizedText.blocks) {
+          final text = block.text.trim();
+          if (text.length > 2 && text.length > maxLength) {
+            maxLength = text.length;
+            candidate = text;
+          }
+        }
+        if (candidate != null) {
+          bestText = candidate;
+          debugPrint("Text detected: $bestText");
+        }
+      }
+
+      if (bestText != null) {
+        // Search product by detected text
+        final product = await ofService.searchByName(bestText);
+        if (product != null) {
+          Navigator.pushReplacementNamed(
+            context,
+            Routes.result,
+            arguments: product,
+          );
+          return;
+        } else {
+           debugPrint('No product found for text "$bestText", trying labels...');
+        }
+      }
+
+      // 3. Fallback to Image Labeling
+      final labels = await imageLabeler.processImage(inputImage);
+      if (labels.isNotEmpty) {
+        for (final label in labels)
+          debugPrint("Label detected: ${label.label}  | confidence: ${label.confidence}");
+
+        final top = labels.first.label;
+
+        // search product by name
+        final product = await ofService.searchByName(top);
+
+        if (product != null) {
+          Navigator.pushReplacementNamed(
+            context,
+            Routes.result,
+            arguments: product,
+          );
+          return;
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('No product found for "$top" (or text "$bestText")')),
+          );
+        }
       } else {
-        // no barcode in file result; resume streaming
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'No barcode detected in photo — try another product or move closer.',
-            ),
-          ),
+          const SnackBar(content: Text('No labels or text detected in the photo')),
         );
       }
     } catch (e) {
       debugPrint('Fallback capture error: $e');
     } finally {
-      // restart stream and fallback timer
+      // restart stream
       try {
         if (controller != null && controller!.value.isInitialized) {
           await controller!.startImageStream(_processCameraImage);
@@ -140,17 +204,15 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
       } catch (e) {
         debugPrint('Error restarting stream after fallback: $e');
       }
+
       _startFallbackTimer();
     }
   }
 
+
   void _processCameraImage(CameraImage image) async {
     if (_processing) return;
     _processing = true;
-
-    // DEBUG prints to help you see what's happening
-    debugPrint("Frame received: ${image.width}x${image.height}");
-    debugPrint("Image format raw: ${image.format.raw}");
 
     try {
       // Combine plane bytes to a single Uint8List (as ML Kit expects)
@@ -177,7 +239,6 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
       final inputImage = InputImage.fromBytes(bytes: bytes, metadata: metadata);
 
       final barcodes = await barcodeScanner.processImage(inputImage);
-      debugPrint("Barcodes detected (stream): ${barcodes.length}");
 
       if (barcodes.isNotEmpty) {
         final code = barcodes.first.rawValue;
@@ -190,7 +251,6 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
       // no barcode: reset fallback timer to keep trying until fallback fires
       _resetFallbackTimer();
     } catch (e) {
-      debugPrint("Frame processing error: $e");
       // continue — fallback will be attempted eventually
     } finally {
       // throttle a bit so we don't hog CPU
@@ -201,7 +261,6 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _onBarcodeDetected(String code) async {
-    debugPrint("Detected barcode: $code");
 
     try {
       await controller?.stopImageStream();
@@ -249,7 +308,6 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
           await controller!.startImageStream(_processCameraImage);
         }
       } catch (e) {
-        debugPrint('resume error: $e');
       } finally {
         _processing = false;
         _startFallbackTimer();
@@ -274,7 +332,6 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
                 await controller!.setFlashMode(newMode);
                 setState(() {});
               } catch (e) {
-                debugPrint('Flash error: $e');
               }
             },
             icon: Icon(Icons.flash_on),
@@ -322,6 +379,7 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     controller?.dispose();
     barcodeScanner.close();
+    textRecognizer.close();
     _resumeTimer?.cancel();
     _fallbackTimer?.cancel();
     super.dispose();
