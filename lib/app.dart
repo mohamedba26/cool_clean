@@ -8,7 +8,9 @@ class BoycottApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Boycott Scanner',
-      theme: buildTheme(),
+      theme: buildTheme(isDark: false),
+      darkTheme: buildTheme(isDark: true),
+      themeMode: ThemeMode.system,
       initialRoute: Routes.home,
       routes: appRoutes,
       debugShowCheckedModeBanner: false,
