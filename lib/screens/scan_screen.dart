@@ -112,48 +112,67 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
     XFile? xfile;
 
     try {
+      debugPrint("Attempting fallback scan...");
       xfile = await controller!.takePicture();
 
       final inputImage = InputImage.fromFilePath(xfile.path);
 
+      // 1. Try Barcode
       final barcodes = await barcodeScanner.processImage(inputImage);
 
       if (barcodes.isNotEmpty) {
         final code = barcodes.first.rawValue;
         if (code != null && code.isNotEmpty) {
+          debugPrint("Barcode detected: $code");
           await _onBarcodeDetected(code);
           return;
         }
       }
-      // 2. Try Text Recognition
+      
+      debugPrint("No barcode detected, proceeding with text and image analysis.");
+
+      // 2. Always run image labeling and log the results.
+      debugPrint("Attempting image labeling...");
+      final labels = await imageLabeler.processImage(inputImage);
+      String? topLabel;
+      if (labels.isNotEmpty) {
+        for (final label in labels) {
+          debugPrint("Label detected: ${label.label}  | confidence: ${label.confidence}");
+        }
+        topLabel = labels.first.label;
+      } else {
+        debugPrint("No labels detected in the image.");
+      }
+
+      // 3. Try Text Recognition
+      debugPrint("Trying text recognition...");
       final recognizedText = await textRecognizer.processImage(inputImage);
       String? bestText;
 
-      // Simple heuristic: take the largest block of text or just the first non-empty one
-      // You can refine this to look for specific patterns or largest bounding box
+      // New heuristic: find the text block that's highest up in the image.
       if (recognizedText.blocks.isNotEmpty) {
-        // filter out small text or numbers if needed
-        // For now, let's try the longest block found, as brand names are often prominent
         String? candidate;
-        int maxLength = 0;
+        double minY = double.infinity;
 
         for (final block in recognizedText.blocks) {
-          final text = block.text.trim();
-          if (text.length > 2 && text.length > maxLength) {
-            maxLength = text.length;
+          final text = block.text.trim().replaceAll('\n', ' ');
+          if (text.length > 2 && block.boundingBox.top < minY) {
+            minY = block.boundingBox.top;
             candidate = text;
           }
         }
         if (candidate != null) {
           bestText = candidate;
-          debugPrint("Text detected: $bestText");
+          debugPrint("Text detected (top-most): $bestText");
         }
       }
 
+      // Prioritize text recognition results for product search
       if (bestText != null) {
-        // Search product by detected text
+        debugPrint("Searching for product with text: '$bestText'");
         final product = await ofService.searchByName(bestText);
         if (product != null) {
+          debugPrint("Product found for text: '${product.name}'");
           Navigator.pushReplacementNamed(
             context,
             Routes.result,
@@ -161,22 +180,19 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
           );
           return;
         } else {
-           debugPrint('No product found for text "$bestText", trying labels...');
+           debugPrint('No product found for text "$bestText".');
         }
+      } else {
+        debugPrint("No usable text detected.");
       }
 
-      // 3. Fallback to Image Labeling
-      final labels = await imageLabeler.processImage(inputImage);
-      if (labels.isNotEmpty) {
-        for (final label in labels)
-          debugPrint("Label detected: ${label.label}  | confidence: ${label.confidence}");
-
-        final top = labels.first.label;
-
-        // search product by name
-        final product = await ofService.searchByName(top);
+      // 4. If text recognition fails, fall back to using the top image label.
+      if (topLabel != null) {
+        debugPrint("Falling back to top image label. Searching for product with label: '$topLabel'");
+        final product = await ofService.searchByName(topLabel);
 
         if (product != null) {
+          debugPrint("Product found for label: '${product.name}'");
           Navigator.pushReplacementNamed(
             context,
             Routes.result,
@@ -184,13 +200,15 @@ class _ScanScreenState extends State<ScanScreen> with WidgetsBindingObserver {
           );
           return;
         } else {
+          debugPrint('No product found for label "$topLabel"');
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('No product found for "$top" (or text "$bestText")')),
+            SnackBar(content: Text('No product found for "$topLabel" (or text "$bestText")')),
           );
         }
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('No labels or text detected in the photo')),
+        // Only show this if both text and label searches have nothing to go on.
+         ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No product, text, or labels could be identified.')),
         );
       }
     } catch (e) {
